@@ -148,7 +148,7 @@ class BinanceBalanceChecker:
         endpoint = "/api/v3/account"
         
         timestamp = int(time.time() * 1000)
-        query_string = f"timestamp={timestamp}"
+        query_string = f"timestamp={timestamp}&recvWindow=60000"
         signature = self.get_binance_signature(query_string, api_secret)
         
         headers = {
