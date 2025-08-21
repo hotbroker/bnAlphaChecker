@@ -143,7 +143,7 @@ class BinanceBalanceChecker:
         ).hexdigest()
 
     def get_account_balance(self, api_key: str, api_secret: str) -> Dict[str, Any]:
-        """获取币安账户余额"""
+        """获取币安现货账户余额"""
         base_url = "https://api.binance.com"
         endpoint = "/api/v3/account"
         
@@ -162,11 +162,84 @@ class BinanceBalanceChecker:
             if response.status_code == 200:
                 return response.json()
             else:
-                logger.error(f"币安API请求失败: {response.status_code}, {response.text}")
+                logger.error(f"币安现货账户API请求失败: {response.status_code}, {response.text}")
                 return {}
         except Exception as e:
-            logger.error(f"获取余额失败: {e}")
+            logger.error(f"获取现货账户余额失败: {e}")
             return {}
+
+    def get_funding_wallet_balance(self, api_key: str, api_secret: str) -> Dict[str, Any]:
+        """获取币安资金账户余额"""
+        base_url = "https://api.binance.com"
+        endpoint = "/sapi/v1/asset/get-funding-asset"
+        
+        timestamp = int(time.time() * 1000)
+        query_string = f"timestamp={timestamp}&recvWindow=60000"
+        signature = self.get_binance_signature(query_string, api_secret)
+        
+        headers = {
+            'X-MBX-APIKEY': api_key
+        }
+        
+        url = f"{base_url}{endpoint}?{query_string}&signature={signature}"
+        
+        try:
+            response = requests.post(url, headers=headers, timeout=10)
+            if response.status_code == 200:
+                return response.json()
+            else:
+                logger.error(f"币安资金账户API请求失败: {response.status_code}, {response.text}")
+                return {}
+        except Exception as e:
+            logger.error(f"获取资金账户余额失败: {e}")
+            return {}
+
+    def convert_funding_to_usdt(self, funding_assets: List[Dict]) -> float:
+        """将资金账户资产转换为USDT价值"""
+        total_usdt = 0.0
+        
+        # 获取所有需要的交易对价格
+        symbols_needed = []
+        for asset in funding_assets:
+            asset_name = asset['asset']
+            free = float(asset['free'])
+            
+            if free > 0:
+                if asset_name == 'USDT':
+                    total_usdt += free
+                elif asset_name in ['BUSD', 'USDC']:
+                    total_usdt += free  # 稳定币通常与USDT等价
+                else:
+                    symbols_needed.append(f"{asset_name}USDT")
+        
+        if symbols_needed:
+            # 批量获取价格
+            try:
+                price_url = "https://api.binance.com/api/v3/ticker/price"
+                response = requests.get(price_url, timeout=10)
+                if response.status_code == 200:
+                    all_prices = response.json()
+                    price_dict = {item['symbol']: float(item['price']) for item in all_prices}
+                    
+                    # 计算每个资产的USDT价值
+                    for asset in funding_assets:
+                        asset_name = asset['asset']
+                        free = float(asset['free'])
+                        
+                        if free > 0 and asset_name not in ['USDT', 'BUSD', 'USDC']:
+                            symbol = f"{asset_name}USDT"
+                            if symbol in price_dict:
+                                total_usdt += free * price_dict[symbol]
+                            else:
+                                # 尝试通过BTC转换
+                                btc_symbol = f"{asset_name}BTC"
+                                if btc_symbol in price_dict and 'BTCUSDT' in price_dict:
+                                    btc_value = free * price_dict[btc_symbol]
+                                    total_usdt += btc_value * price_dict['BTCUSDT']
+            except Exception as e:
+                logger.error(f"获取资金账户价格失败: {e}")
+        
+        return total_usdt
 
     def convert_to_usdt(self, balances: List[Dict]) -> float:
         """将所有资产转换为USDT价值"""
@@ -185,6 +258,8 @@ class BinanceBalanceChecker:
                     total_usdt += total_balance
                 elif asset == 'BUSD':
                     total_usdt += total_balance  # BUSD通常与USDT等价
+                elif asset == 'USDC':
+                    total_usdt += total_balance  # BUSD通常与USDT等价                    
                 else:
                     symbols_needed.append(f"{asset}USDT")
         
@@ -231,60 +306,90 @@ class BinanceBalanceChecker:
         ).decode('utf-8')
         return signature
 
-    def get_okx_wallet_balance(self, address: str, chains: str, okx_config: Dict[str, str]) -> float:
-        """使用OKX OS API获取钱包余额"""
-        base_url = "https://web3.okx.com"
-        endpoint = "/api/v5/wallet/asset/total-value-by-address"
+    def get_okx_wallet_balance(self, address: str, chains: str, okx_config: Dict[str, str]) -> tuple[float, bool]:
+        """使用OKX OS API获取钱包余额，带重试机制
         
-        # 构建请求参数
-        params = {
-            'address': address,
-            'chains': chains,
-            'assetType': '0',  # 查询所有资产
-            'excludeRiskToken': 'true'  # 过滤风险代币
-        }
+        Returns:
+            tuple[float, bool]: (余额, 是否获取成功)
+        """
+        max_retries = 5
+        retry_delay = 2  # 重试间隔2秒
         
-        # 构建查询字符串
-        query_string = '&'.join([f"{k}={v}" for k, v in params.items()])
-        url = f"{base_url}{endpoint}?{query_string}"
-        
-        # 生成时间戳
-        timestamp = str(int(time.time() * 1000))
-        
-        # 生成签名
-        signature = self.get_okx_signature(
-            timestamp, 
-            'GET', 
-            f"{endpoint}?{query_string}", 
-            '', 
-            okx_config['secret_key']
-        )
-        
-        headers = {
-            'OK-ACCESS-PROJECT': okx_config['project_id'],
-            'OK-ACCESS-KEY': okx_config['api_key'],
-            'OK-ACCESS-SIGN': signature,
-            'OK-ACCESS-PASSPHRASE': okx_config['passphrase'],
-            'OK-ACCESS-TIMESTAMP': timestamp,
-            'Content-Type': 'application/json'
-        }
-        
-        try:
-            response = requests.get(url, headers=headers, timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('code') == '0' and data.get('data'):
-                    total_value = float(data['data'][0].get('totalValue', '0'))
-                    return total_value
+        for attempt in range(max_retries):
+            try:
+                base_url = "https://web3.okx.com"
+                endpoint = "/api/v5/wallet/asset/total-value-by-address"
+                
+                # 构建请求参数
+                params = {
+                    'address': address,
+                    'chains': chains,
+                    'assetType': '0',  # 查询所有资产
+                    'excludeRiskToken': 'true'  # 过滤风险代币
+                }
+                
+                # 构建查询字符串
+                query_string = '&'.join([f"{k}={v}" for k, v in params.items()])
+                url = f"{base_url}{endpoint}?{query_string}"
+                
+                # 生成时间戳
+                timestamp = str(int(time.time() * 1000))
+                
+                # 生成签名
+                signature = self.get_okx_signature(
+                    timestamp, 
+                    'GET', 
+                    f"{endpoint}?{query_string}", 
+                    '', 
+                    okx_config['secret_key']
+                )
+                
+                headers = {
+                    'OK-ACCESS-PROJECT': okx_config['project_id'],
+                    'OK-ACCESS-KEY': okx_config['api_key'],
+                    'OK-ACCESS-SIGN': signature,
+                    'OK-ACCESS-PASSPHRASE': okx_config['passphrase'],
+                    'OK-ACCESS-TIMESTAMP': timestamp,
+                    'Content-Type': 'application/json'
+                }
+                
+                logger.info(f"OKX API第{attempt + 1}次尝试获取钱包余额: {address[:6]}...{address[-4:]}")
+                
+                response = requests.get(url, headers=headers, timeout=15)
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get('code') == '0' and data.get('data'):
+                        total_value = float(data['data'][0].get('totalValue', '0'))
+                        logger.info(f"OKX API第{attempt + 1}次尝试成功，余额: ${total_value:.2f}")
+                        return total_value, True
+                    else:
+                        error_msg = data.get('msg', 'Unknown error')
+                        logger.warning(f"OKX API第{attempt + 1}次尝试失败: {error_msg}")
+                        if attempt < max_retries - 1:
+                            time.sleep(retry_delay)
+                            continue
+                        else:
+                            logger.error(f"OKX API所有重试均失败，最后错误: {error_msg}")
+                            return 0.0, False
                 else:
-                    logger.error(f"OKX API错误: {data.get('msg', 'Unknown error')}")
-                    return 0.0
-            else:
-                logger.error(f"OKX API请求失败: {response.status_code}, {response.text}")
-                return 0.0
-        except Exception as e:
-            logger.error(f"获取OKX钱包余额失败: {e}")
-            return 0.0
+                    logger.warning(f"OKX API第{attempt + 1}次尝试失败: HTTP {response.status_code}, {response.text}")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        logger.error(f"OKX API所有重试均失败，最后HTTP错误: {response.status_code}")
+                        return 0.0, False
+                        
+            except Exception as e:
+                logger.warning(f"OKX API第{attempt + 1}次尝试异常: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    logger.error(f"OKX API所有重试均失败，最后异常: {e}")
+                    return 0.0, False
+        
+        return 0.0, False
 
     def save_balance_to_db(self, account_type: str, account_note: str, account_identifier: str, total_usdt: float, asset_details: str):
         """保存余额记录到数据库"""
@@ -347,7 +452,9 @@ class BinanceBalanceChecker:
             okx_result = self.check_okx_wallet_silent(account, okx_wallet, okx_api_config)
             if okx_result:
                 user_assets['okx_wallet'] = okx_result
-                user_assets['total_usd'] += okx_result['total_usd']
+                # 只有获取成功时才计入总资产
+                if okx_result.get('fetch_success', True):
+                    user_assets['total_usd'] += okx_result['total_usd']
         
         # 发送汇总通知
         if notification_settings.get('enable_notifications', True) and notify_users:
@@ -371,38 +478,73 @@ class BinanceBalanceChecker:
         
         logger.info(f"正在检查币安账户: {note}")
         
-        # 获取账户余额
+        # 获取现货账户余额
         account_data = self.get_account_balance(api_key, api_secret)
-        if not account_data:
-            return None
+
+        spot_total_usdt = 0.0
+        significant_spot_balances = []
         
-        balances = account_data.get('balances', [])
-        total_usdt = self.convert_to_usdt(balances)
+        if account_data:
+            balances = account_data.get('balances', [])
+            spot_total_usdt = self.convert_to_usdt(balances)
+            
+            # 准备现货资产详情
+            for balance in balances:
+                free = float(balance['free'])
+                locked = float(balance['locked'])
+                total_balance = free + locked
+                if total_balance > 0.001:  # 过滤掉极小余额
+                    significant_spot_balances.append({
+                        'asset': balance['asset'],
+                        'total': total_balance,
+                        'free': free,
+                        'locked': locked,
+                        'account_type': 'spot'
+                    })
         
-        # 准备资产详情
-        significant_balances = []
-        for balance in balances:
-            free = float(balance['free'])
-            locked = float(balance['locked'])
-            total_balance = free + locked
-            if total_balance > 0.001:  # 过滤掉极小余额
-                significant_balances.append({
-                    'asset': balance['asset'],
-                    'total': total_balance,
-                    'free': free,
-                    'locked': locked
-                })
+        # 获取资金账户余额
+        funding_data = self.get_funding_wallet_balance(api_key, api_secret)
+        funding_total_usdt = 0.0
+        significant_funding_balances = []
         
-        asset_details = json.dumps(significant_balances, ensure_ascii=False)
+        if funding_data:
+            funding_total_usdt = self.convert_funding_to_usdt(funding_data)
+            
+            # 准备资金账户资产详情
+            for asset in funding_data:
+                free = float(asset['free'])
+                if free > 0.001:  # 过滤掉极小余额
+                    significant_funding_balances.append({
+                        'asset': asset['asset'],
+                        'total': free,
+                        'free': free,
+                        'locked': 0,
+                        'account_type': 'funding'
+                    })
+        
+        # 合并所有资产
+        all_balances = significant_spot_balances + significant_funding_balances
+        total_usdt = spot_total_usdt + funding_total_usdt
+        
+        asset_details = json.dumps({
+            'spot_balances': significant_spot_balances,
+            'funding_balances': significant_funding_balances,
+            'spot_total_usdt': spot_total_usdt,
+            'funding_total_usdt': funding_total_usdt
+        }, ensure_ascii=False)
         
         # 保存到数据库
         self.save_balance_to_db('binance', note, api_key, total_usdt, asset_details)
         
-        logger.info(f"币安账户 {note} 总价值: ${total_usdt:.2f} USDT")
+        logger.info(f"币安账户 {note} 现货: ${spot_total_usdt:.2f} USDT, 资金: ${funding_total_usdt:.2f} USDT, 总计: ${total_usdt:.2f} USDT")
         
         return {
             'total_usdt': total_usdt,
-            'balances': significant_balances,
+            'spot_total_usdt': spot_total_usdt,
+            'funding_total_usdt': funding_total_usdt,
+            'balances': all_balances,
+            'spot_balances': significant_spot_balances,
+            'funding_balances': significant_funding_balances,
             'note': note
         }
 
@@ -410,7 +552,6 @@ class BinanceBalanceChecker:
         """静默检查用户的OKX钱包（不发送通知）"""
         address = okx_wallet.get('address')
         chains = okx_wallet.get('chains', '1')  # 默认以太坊主网
-        logger.info(f'chains')
         note = account.get('note', '未命名用户')
 
         
@@ -427,51 +568,63 @@ class BinanceBalanceChecker:
         logger.info(f"正在检查用户 {note} 的OKX钱包: {address[:6]}...{address[-4:]}")
         
         # 获取钱包余额
-        total_usd = self.get_okx_wallet_balance(address, chains, okx_config)
-        if total_usd == 0:
-            logger.warning(f"用户 {note} 的OKX钱包余额为0或获取失败")
+        total_usd, success = self.get_okx_wallet_balance(address, chains, okx_config)
+        if not success:
+            logger.warning(f"用户 {note} 的OKX钱包余额获取失败")
         
         # OKX API返回的是总值，不需要详细的资产列表
         asset_details = json.dumps({
             'address': address,
             'chains': chains,
-            'total_value_usd': total_usd
+            'total_value_usd': total_usd,
+            'fetch_success': success
         }, ensure_ascii=False)
         
         # 保存到数据库
         wallet_note = f"{note}-OKX钱包"
         self.save_balance_to_db('okx_wallet', wallet_note, address, total_usd, asset_details)
         
-        logger.info(f"用户 {note} 的OKX钱包总价值: ${total_usd:.2f} USD")
+        if success:
+            logger.info(f"用户 {note} 的OKX钱包总价值: ${total_usd:.2f} USD")
+        else:
+            logger.warning(f"用户 {note} 的OKX钱包余额获取失败")
         
         return {
             'total_usd': total_usd,
             'address': address,
             'chains': chains,
-            'note': wallet_note
+            'note': wallet_note,
+            'fetch_success': success
         }
 
     def format_user_assets_message(self, user_note: str, user_assets: Dict) -> str:
         """格式化用户资产汇总消息"""
-        message = f"💰 用户资产报告\n"
-        message += f"用户: {user_note}\n"
+        message = f"💰 用户资产报告\n\n"
+        message += f"用户:【 {user_note}】\n"
         message += f"检查时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         message += f"总资产价值: ${user_assets['total_usd']:.2f} USD\n\n"
         
         # 币安账户信息
         if user_assets.get('binance'):
             binance = user_assets['binance']
-            message += f"🏢 币安账户: ${binance['total_usdt']:.2f} USDT\n"
+            message += f"🏢 币安交所: ${binance['total_usdt']:.2f} USDT\n"
             
-            # 显示主要资产
+            # 显示现货和资金账户分别的余额
+            if binance.get('spot_total_usdt', 0) > 0:
+                message += f"  📈 现货账户: ${binance['spot_total_usdt']:.2f} USDT\n"
+            if binance.get('funding_total_usdt', 0) > 0:
+                message += f"  💰 资金账户: ${binance['funding_total_usdt']:.2f} USDT\n"
+            
+            # 显示主要资产（现货+资金账户）
             if binance.get('balances'):
                 balances = binance['balances']
                 balances.sort(key=lambda x: x['total'], reverse=True)
-                top_assets = [b for b in balances[:5] if b['total'] > 1]  # 只显示前5个大于1的资产
+                top_assets = [b for b in balances[:8] if b['total'] > 1]  # 显示前8个大于1的资产
                 if top_assets:
-                    message += "主要币安资产:\n"
+                    message += "主要资产:\n"
                     for asset in top_assets:
-                        message += f"  • {asset['asset']}: {asset['total']:.4f}\n"
+                        account_type_symbol = "📈" if asset.get('account_type') == 'spot' else "💰"
+                        message += f"  {account_type_symbol} {asset['asset']}: {asset['total']:.4f}\n"
         else:
             message += "🏢 币安账户: 未配置或获取失败\n"
         
@@ -491,11 +644,13 @@ class BinanceBalanceChecker:
             chain_list = okx['chains'].split(',')
             chain_display = ', '.join([chain_names.get(chain.strip(), f'Chain-{chain.strip()}') for chain in chain_list])
             
-            message += f"\n💼 OKX钱包: ${okx['total_usd']:.2f} USD\n"
+            if okx.get('fetch_success', True):
+                message += f"\n💼 链上钱包: ${okx['total_usd']:.2f} USD\n"
+            else:
+                message += f"\n💼 链上钱包: ❌ 获取失败\n"
             message += f"地址: {okx['address'][:6]}...{okx['address'][-4:]}\n"
-            message += f"链: {chain_display}\n"
         else:
-            message += "\n💼 OKX钱包: 未配置或获取失败\n"
+            message += "\n💼 钱包: 未配置\n"
         
         return message
 
@@ -512,42 +667,72 @@ class BinanceBalanceChecker:
         
         logger.info(f"正在检查币安账户: {note}")
         
-        # 获取账户余额
+        # 获取现货账户余额
         account_data = self.get_account_balance(api_key, api_secret)
-        if not account_data:
-            return
+        spot_total_usdt = 0.0
+        significant_spot_balances = []
         
-        balances = account_data.get('balances', [])
-        total_usdt = self.convert_to_usdt(balances)
+        if account_data:
+            balances = account_data.get('balances', [])
+            spot_total_usdt = self.convert_to_usdt(balances)
+            
+            # 准备现货资产详情
+            for balance in balances:
+                free = float(balance['free'])
+                locked = float(balance['locked'])
+                total_balance = free + locked
+                if total_balance > 0.001:  # 过滤掉极小余额
+                    significant_spot_balances.append({
+                        'asset': balance['asset'],
+                        'total': total_balance,
+                        'free': free,
+                        'locked': locked,
+                        'account_type': 'spot'
+                    })
         
-        # 准备资产详情
-        significant_balances = []
-        for balance in balances:
-            free = float(balance['free'])
-            locked = float(balance['locked'])
-            total_balance = free + locked
-            if total_balance > 0.001:  # 过滤掉极小余额
-                significant_balances.append({
-                    'asset': balance['asset'],
-                    'total': total_balance,
-                    'free': free,
-                    'locked': locked
-                })
+        # 获取资金账户余额
+        funding_data = self.get_funding_wallet_balance(api_key, api_secret)
+        funding_total_usdt = 0.0
+        significant_funding_balances = []
         
-        asset_details = json.dumps(significant_balances, ensure_ascii=False)
+        if funding_data:
+            funding_total_usdt = self.convert_funding_to_usdt(funding_data)
+            
+            # 准备资金账户资产详情
+            for asset in funding_data:
+                free = float(asset['free'])
+                if free > 0.001:  # 过滤掉极小余额
+                    significant_funding_balances.append({
+                        'asset': asset['asset'],
+                        'total': free,
+                        'free': free,
+                        'locked': 0,
+                        'account_type': 'funding'
+                    })
+        
+        # 合并所有资产
+        significant_balances = significant_spot_balances + significant_funding_balances
+        total_usdt = spot_total_usdt + funding_total_usdt
+        
+        asset_details = json.dumps({
+            'spot_balances': significant_spot_balances,
+            'funding_balances': significant_funding_balances,
+            'spot_total_usdt': spot_total_usdt,
+            'funding_total_usdt': funding_total_usdt
+        }, ensure_ascii=False)
         
         # 保存到数据库
         self.save_balance_to_db('binance', note, api_key, total_usdt, asset_details)
         
         # 发送通知
         if notification_settings.get('enable_notifications', True):
-            message = self.format_balance_message(note, total_usdt, significant_balances, 'Binance')
+            message = self.format_balance_message(note, total_usdt, significant_balances, 'Binance', spot_total_usdt, funding_total_usdt)
             title = notification_settings.get('title', '余额监控')
             
             for user in notify_users:
                 sendtext_remote_async(user, message, title)
         
-        logger.info(f"币安账户 {note} 总价值: ${total_usdt:.2f} USDT")
+        logger.info(f"币安账户 {note} 现货: ${spot_total_usdt:.2f} USDT, 资金: ${funding_total_usdt:.2f} USDT, 总计: ${total_usdt:.2f} USDT")
 
     def check_user_okx_wallet(self, account: Dict, okx_wallet: Dict, okx_config: Dict, notification_settings: Dict):
         """检查用户的OKX钱包"""
@@ -569,9 +754,9 @@ class BinanceBalanceChecker:
         logger.info(f"正在检查用户 {note} 的OKX钱包: {address[:6]}...{address[-4:]}")
         
         # 获取钱包余额
-        total_usdt = self.get_okx_wallet_balance(address, chains, okx_config)
-        if total_usdt == 0:
-            logger.warning(f"用户 {note} 的OKX钱包余额为0或获取失败")
+        total_usdt, success = self.get_okx_wallet_balance(address, chains, okx_config)
+        if not success:
+            logger.warning(f"用户 {note} 的OKX钱包余额获取失败")
         
         # OKX API返回的是总值，不需要详细的资产列表
         asset_details = json.dumps({
@@ -586,7 +771,7 @@ class BinanceBalanceChecker:
         
         # 发送通知
         if notification_settings.get('enable_notifications', True):
-            message = self.format_okx_balance_message(wallet_note, address, total_usdt, chains)
+            message = self.format_okx_balance_message(wallet_note, address, total_usdt, chains, success)
             title = notification_settings.get('title', '余额监控')
             
             for user in notify_users:
@@ -594,24 +779,36 @@ class BinanceBalanceChecker:
         
         logger.info(f"用户 {note} 的OKX钱包总价值: ${total_usdt:.2f} USD")
 
-    def format_balance_message(self, account_note: str, total_usdt: float, balances: List[Dict], account_type: str = '') -> str:
+    def format_balance_message(self, account_note: str, total_usdt: float, balances: List[Dict], account_type: str = '', spot_total: float = 0, funding_total: float = 0) -> str:
         """格式化币安账户余额消息"""
         message = f"📊 {account_type}账户余额报告\n"
         message += f"账户: {account_note}\n"
         message += f"总价值: ${total_usdt:.2f} USDT\n"
+        
+        # 如果有现货和资金账户的详细信息，则显示
+        if spot_total > 0 or funding_total > 0:
+            if spot_total > 0:
+                message += f"  📈 现货账户: ${spot_total:.2f} USDT\n"
+            if funding_total > 0:
+                message += f"  💰 资金账户: ${funding_total:.2f} USDT\n"
+        
         message += f"检查时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
         
         if balances:
             message += "主要资产:\n"
             # 按总价值排序
             balances.sort(key=lambda x: x['total'], reverse=True)
-            for balance in balances[:10]:  # 只显示前10个
+            for balance in balances[:12]:  # 显示前12个
                 if balance['total'] > 1:  # 只显示大于1的资产
-                    message += f"• {balance['asset']}: {balance['total']:.4f}\n"
+                    account_type_symbol = "📈" if balance.get('account_type') == 'spot' else "💰"
+                    if balance.get('account_type'):
+                        message += f"{account_type_symbol} {balance['asset']}: {balance['total']:.4f}\n"
+                    else:
+                        message += f"• {balance['asset']}: {balance['total']:.4f}\n"
         
         return message
 
-    def format_okx_balance_message(self, wallet_note: str, address: str, total_usd: float, chains: str) -> str:
+    def format_okx_balance_message(self, wallet_note: str, address: str, total_usd: float, chains: str, fetch_success: bool = True) -> str:
         """格式化OKX钱包余额消息"""
         # 链ID映射
         chain_names = {
@@ -631,7 +828,12 @@ class BinanceBalanceChecker:
         message += f"钱包: {wallet_note}\n"
         message += f"地址: {address[:6]}...{address[-4:]}\n"
         message += f"链: {chain_display}\n"
-        message += f"总价值: ${total_usd:.2f} USD\n"
+        
+        if fetch_success:
+            message += f"总价值: ${total_usd:.2f} USD\n"
+        else:
+            message += f"总价值: ❌ 获取失败（已重试5次）\n"
+        
         message += f"检查时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         
         return message
