@@ -651,7 +651,7 @@ class BinanceBalanceChecker:
             message += f"地址: {okx['address'][:6]}...{okx['address'][-4:]}\n"
         else:
             message += "\n💼 钱包: 未配置\n"
-        
+        message += f"\n检查时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         return message
 
     def check_binance_account(self, account: Dict, notification_settings: Dict):
@@ -847,7 +847,7 @@ class BinanceBalanceChecker:
         self.check_all_accounts()
         
         # 设置定时任务
-        schedule.every().minutes.do(self.check_all_accounts)
+        schedule.every(6).hours.do(self.check_all_accounts)
         
         while True:
             schedule.run_pending()
